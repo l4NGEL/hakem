@@ -112,6 +112,7 @@ def process_message(body: dict) -> str:
     try:
         obj = s3.get_object(Bucket=bucket, Key=key)
     except ClientError as exc:
+        _set_status(ddb, job_id, "QUEUED")  # do not leave the job looking "in progress"
         raise TransientError(f"s3 get_object failed: {exc}") from exc
     raw = obj["Body"].read(MAX_BYTES + 1)
     if len(raw) > MAX_BYTES:

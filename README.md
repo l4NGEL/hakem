@@ -52,7 +52,7 @@ flowchart LR
 | Tests | analyzer **25** (pytest, AWS mocked with moto), API **11** (JUnit 5 + MockMvc), web **4** (Vitest + Testing Library) |
 | Seeded-defect evaluation of the rules ([`eval/inject_eval.py`](analyzer/eval/inject_eval.py)) | 11 defect types injected at random positions into two clean drafts (English/numeric, Turkish/author–year), 1–3 per draft, 400 drafts × 3 seeds: **every injected defect reported, no unrelated findings**, 0 findings on the clean drafts |
 | Local end-to-end run | upload → S3 → DynamoDB → SQS → Lambda → report in **2.3 s** (rules only); report served from Redis on the next read (TTL 1 h) |
-| Retry path | a message pointing at a missing S3 object was retried and moved to the dead-letter queue after 3 receives — see below |
+| Retry path | a message pointing at a missing S3 object was retried and moved to the dead-letter queue after 3 receives (182 s with a 60 s visibility timeout). This run found a bug: the job was left in `PROCESSING`; it now returns to `QUEUED` on a transient failure |
 | Infrastructure | `cfn-lint` passes on the SAM template with no warnings |
 
 **What the seeded evaluation does and does not show.** It checks that each rule fires when its defect is present and stays quiet otherwise, across two writing conventions. Getting there found real bugs, in the rules (Turkish lower-casing turned "Introduction" into "ıntroduction") and in the test harness (two injected defects that cancelled each other out). It is not evidence about real manuscripts: the drafts were written for this project, and real papers use heading and citation styles the rules do not cover.
@@ -90,6 +90,7 @@ sam deploy --guided --capabilities CAPABILITY_IAM \
 - **The stack has not been deployed to an AWS account.** The template is validated with `cfn-lint`; the code paths are exercised against emulators and moto.
 - On AWS the API uses an in-process cache. Using ElastiCache would need a VPC connector for App Runner, which the template does not include.
 - The rules see text only: no PDF or LaTeX input, no checking of reference formatting, and heading detection is heuristic.
+- A job whose message ends in the dead-letter queue stays `QUEUED`; nothing yet marks it `FAILED` (a DLQ consumer would).
 - The web front end is not part of the SAM template (it is a static build that can be served from S3 + CloudFront).
 
 ---

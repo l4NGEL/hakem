@@ -68,6 +68,7 @@ def test_missing_object_is_retried_alone(aws):
     out = handler.lambda_handler({"Records": [good, bad]}, None)
     assert out == {"batchItemFailures": [{"itemIdentifier": "m-bad"}]}
     assert item(ddb, "ok")["status"]["S"] == "DONE"
+    assert item(ddb, "ok2")["status"]["S"] == "QUEUED"
 
 
 def test_llm_rate_limit_requeues_and_retries(aws, monkeypatch):
