@@ -1,0 +1,230 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Hakem - manuscript feedback. S3 for uploads, DynamoDB for job state, SQS (with a
+  dead-letter queue) between the API and the analyzer Lambda, App Runner for the
+  Spring Boot API.
+
+  Build and deploy (needs Docker and an AWS account):
+    sam build -t infra/template.yaml
+    sam deploy --guided --capabilities CAPABILITY_IAM
+
+Parameters:
+  ApiImageUri:
+    Type: String
+    Description: ECR image URI of the Spring Boot API (built from api/Dockerfile and pushed).
+  AnthropicApiKeySecretArn:
+    Type: String
+    Default: ""
+    Description: >
+      Secrets Manager secret holding the Anthropic API key (plain string). Leave empty
+      to run with the rule-based checks only.
+  AlarmEmail:
+    Type: String
+    Default: ""
+    Description: Optional address notified when messages land in the dead-letter queue.
+
+Conditions:
+  HasApiKey: !Not [!Equals [!Ref AnthropicApiKeySecretArn, ""]]
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
+
+Globals:
+  Function:
+    Architectures: [x86_64]
+    Tracing: Active
+
+Resources:
+  ManuscriptBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-manuscripts
+            Status: Enabled
+            ExpirationInDays: 30
+
+  JobsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: id, KeyType: HASH }
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  JobsDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  JobsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      # AWS recommends at least 6x the function timeout for SQS-triggered Lambdas.
+      VisibilityTimeout: 1800
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt JobsDeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  AnalyzerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      PackageType: Image
+      MemorySize: 1024
+      Timeout: 300
+      # Caps parallel LLM calls so a burst of uploads cannot exhaust the API rate limit.
+      ReservedConcurrentExecutions: 5
+      Environment:
+        Variables:
+          JOBS_TABLE: !Ref JobsTable
+          HAKEM_LLM: auto
+          ANTHROPIC_API_KEY_SECRET_ARN: !If [HasApiKey, !Ref AnthropicApiKeySecretArn, !Ref AWS::NoValue]
+      Policies:
+        - S3ReadPolicy: { BucketName: !Ref ManuscriptBucket }
+        - DynamoDBCrudPolicy: { TableName: !Ref JobsTable }
+        - !If
+          - HasApiKey
+          - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref AnthropicApiKeySecretArn }
+          - !Ref AWS::NoValue
+      Events:
+        Jobs:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt JobsQueue.Arn
+            BatchSize: 5
+            MaximumBatchingWindowInSeconds: 2
+            FunctionResponseTypes: [ReportBatchItemFailures]
+    Metadata:
+      DockerContext: ../analyzer
+      Dockerfile: Dockerfile
+      DockerTag: python3.12
+
+  ApiInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: tasks.apprunner.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: hakem-api
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${ManuscriptBucket.Arn}/manuscripts/*"
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:GetItem, dynamodb:UpdateItem]
+                Resource: !GetAtt JobsTable.Arn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt JobsQueue.Arn
+
+  ApiAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: build.apprunner.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSAppRunnerServicePolicyForECRAccess
+
+  ApiService:
+    Type: AWS::AppRunner::Service
+    Properties:
+      SourceConfiguration:
+        AutoDeploymentsEnabled: false
+        AuthenticationConfiguration:
+          AccessRoleArn: !GetAtt ApiAccessRole.Arn
+        ImageRepository:
+          ImageRepositoryType: ECR
+          ImageIdentifier: !Ref ApiImageUri
+          ImageConfiguration:
+            Port: "8080"
+            RuntimeEnvironmentVariables:
+              - { Name: AWS_REGION, Value: !Ref AWS::Region }
+              - { Name: HAKEM_BUCKET, Value: !Ref ManuscriptBucket }
+              - { Name: HAKEM_JOBS_TABLE, Value: !Ref JobsTable }
+              - { Name: HAKEM_QUEUE_URL, Value: !Ref JobsQueue }
+              # In-process cache on AWS; Redis (ElastiCache) needs a VPC connector, see README.
+              - { Name: HAKEM_CACHE, Value: simple }
+              - { Name: HAKEM_REDIS_HEALTH, Value: "false" }
+      InstanceConfiguration:
+        Cpu: "0.25 vCPU"
+        Memory: "0.5 GB"
+        InstanceRoleArn: !GetAtt ApiInstanceRole.Arn
+      HealthCheckConfiguration:
+        Protocol: HTTP
+        Path: /actuator/health
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasAlarmEmail
+    Properties:
+      Subscription:
+        - { Protocol: email, Endpoint: !Ref AlarmEmail }
+
+  DeadLetterAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Manuscripts failed three times and were moved to the dead-letter queue.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - { Name: QueueName, Value: !GetAtt JobsDeadLetterQueue.QueueName }
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmEmail, [!Ref AlarmTopic], !Ref AWS::NoValue]
+
+  AnalyzerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: The analyzer function is throwing errors.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - { Name: FunctionName, Value: !Ref AnalyzerFunction }
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmEmail, [!Ref AlarmTopic], !Ref AWS::NoValue]
+
+Outputs:
+  ApiUrl:
+    Value: !Sub "https://${ApiService.ServiceUrl}"
+  ManuscriptBucketName:
+    Value: !Ref ManuscriptBucket
+  JobsQueueUrl:
+    Value: !Ref JobsQueue
+  DeadLetterQueueUrl:
+    Value: !Ref JobsDeadLetterQueue

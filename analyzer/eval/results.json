@@ -1,0 +1,42 @@
+{
+  "trials": 400,
+  "seed": 7,
+  "max_defects_per_trial": 3,
+  "clean_baseline_issues": {
+    "en_numeric": [],
+    "tr_author_year": []
+  },
+  "recall_by_defect": {
+    "cite_missing_reference": 1.0,
+    "drop_section": 1.0,
+    "empty_section": 1.0,
+    "long_abstract": 1.0,
+    "long_sentence": 1.0,
+    "missing_figure": 1.0,
+    "mixed_citation_style": 1.0,
+    "short_abstract": 1.0,
+    "uncited_reference": 1.0,
+    "undefined_acronym": 1.0,
+    "unreferenced_figure": 1.0
+  },
+  "injected_by_defect": {
+    "cite_missing_reference": 81,
+    "drop_section": 77,
+    "empty_section": 75,
+    "long_abstract": 77,
+    "long_sentence": 82,
+    "missing_figure": 70,
+    "mixed_citation_style": 66,
+    "short_abstract": 75,
+    "uncited_reference": 97,
+    "undefined_acronym": 56,
+    "unreferenced_figure": 82
+  },
+  "overall_recall": 1.0,
+  "recall_by_sample": {
+    "tr_author_year": 1.0,
+    "en_numeric": 1.0
+  },
+  "spill_over_rate": 0.0,
+  "spill_over_codes": {}
+}

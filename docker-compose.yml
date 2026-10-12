@@ -1,0 +1,77 @@
+# Local end-to-end stack. AWS services are replaced by emulators that speak the
+# same APIs, so the API and the analyzer run unchanged; only endpoints differ.
+#
+#   docker compose up --build
+#   web UI: http://localhost:5173   API: http://localhost:8080
+#
+# Set ANTHROPIC_API_KEY in your shell (or .env) to enable the LLM review; without
+# it the analyzer still produces the rule-based report.
+
+x-aws-env: &aws-env
+  AWS_REGION: eu-central-1
+  AWS_DEFAULT_REGION: eu-central-1
+  AWS_ACCESS_KEY_ID: local
+  AWS_SECRET_ACCESS_KEY: local
+
+services:
+  s3:
+    image: adobe/s3mock:5.2.2
+    ports: ["9090:9090"]
+
+  dynamodb:
+    image: amazon/dynamodb-local:3.3.1
+    command: ["-jar", "DynamoDBLocal.jar", "-inMemory", "-sharedDb"]
+    ports: ["8000:8000"]
+
+  elasticmq:
+    image: softwaremill/elasticmq-native:1.7.1
+    volumes: ["./local/elasticmq.conf:/opt/elasticmq.conf:ro"]
+    ports: ["9324:9324"]
+
+  redis:
+    image: redis:8-alpine
+    ports: ["6379:6379"]
+
+  analyzer:
+    build: ./analyzer
+    environment:
+      <<: *aws-env
+      AWS_ENDPOINT_URL_S3: http://s3:9090
+      AWS_ENDPOINT_URL_DYNAMODB: http://dynamodb:8000
+      HAKEM_S3_ADDRESSING: path
+      JOBS_TABLE: hakem-jobs
+      HAKEM_LLM: auto
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+
+  bridge:
+    image: public.ecr.aws/lambda/python:3.12
+    entrypoint: ["/bin/sh", "-c", "python /bridge/bridge.py"]
+    volumes: ["./local/bridge.py:/bridge/bridge.py:ro"]
+    environment:
+      <<: *aws-env
+      S3_ENDPOINT: http://s3:9090
+      DYNAMODB_ENDPOINT: http://dynamodb:8000
+      SQS_ENDPOINT: http://elasticmq:9324
+      HAKEM_QUEUE_URL: http://elasticmq:9324/000000000000/hakem-jobs
+      HAKEM_BUCKET: hakem-manuscripts
+      HAKEM_JOBS_TABLE: hakem-jobs
+      LAMBDA_URL: http://analyzer:8080/2015-03-31/functions/function/invocations
+    depends_on: [s3, dynamodb, elasticmq, analyzer]
+
+  api:
+    build: ./api
+    environment:
+      <<: *aws-env
+      HAKEM_S3_ENDPOINT: http://s3:9090
+      HAKEM_DYNAMODB_ENDPOINT: http://dynamodb:8000
+      HAKEM_SQS_ENDPOINT: http://elasticmq:9324
+      HAKEM_QUEUE_URL: http://elasticmq:9324/000000000000/hakem-jobs
+      HAKEM_CORS_ORIGINS: http://localhost:5173
+      REDIS_HOST: redis
+    ports: ["8080:8080"]
+    depends_on: [redis, bridge]
+
+  web:
+    build: ./web
+    ports: ["5173:80"]
+    depends_on: [api]
